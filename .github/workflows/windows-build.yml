@@ -317,6 +317,8 @@ jobs:
           & C:\b\veyra_xbox_tests.exe
           & C:\b\veyra_moonlight_protocol_tests.exe
           & C:\b\veyra_remoteplay_udp_buffer_tests.exe
+          if (Test-Path C:\b\qml-tests) { Remove-Item C:\b\qml-tests -Recurse -Force }
+          Copy-Item tests\qml\quick C:\b\qml-tests -Recurse -Force
           & C:\b\veyra_qml_quick_tests.exe
 
       - name: Stage portable package
