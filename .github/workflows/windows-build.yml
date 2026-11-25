@@ -1,24 +1,24 @@
 name: Windows build (reproducible)
 
-# Builds veyra_qml_ui.exe and the virtual camera on a clean GitHub-hosted
-# runner. Every dependency is fetched from its upstream source at a pinned
-# commit (see scripts/ci/fetch-sdks.ps1); FFmpeg 9.0.1 is built from source by
-# vcpkg at this repository's builtin-baseline with scripts/ffmpeg/*.patch.
-# Outputs: a portable zip without proprietary runtime DLLs, SHA256SUMS and,
-# outside pull requests, a signed build-provenance attestation so users can
-# check that a download came from this workflow:
-#   gh attestation verify <zip> -R Likely7/Veyra-NRVideo
+# Full-featured Windows x64 build (PS5 Remote Play, Moonlight, Xbox streaming +
+# background controller control, NVIDIA DLSS/VFG/VFX, AMD FSR/AMF, Intel XeSS,
+# RIFE headers, libdovi, patched FFmpeg 9.0.1, libass, virtual camera).
+# Outputs a portable zip without proprietary GPU runtime DLLs.
 
 on:
   workflow_dispatch:
   push:
-    # Branch pushes run only when the CI files change; version tags always run
-    # (GitHub does not apply path filters to tag pushes).
-    branches: ['**']
+    branches: ['ci/**', 'main']
     tags: ['v*']
     paths:
       - '.github/workflows/windows-build.yml'
       - 'scripts/ci/**'
+      - 'src/**'
+      - 'include/**'
+      - 'qml/**'
+      - 'i18n/**'
+      - 'tests/**'
+      - 'CMakeLists.txt'
   pull_request:
     paths:
       - '.github/workflows/windows-build.yml'
@@ -35,6 +35,9 @@ env:
   VCPKG_COMMIT: 30ef65cad98f08e7197c9a1656fbd871bcb72f2d   # = vcpkg.json builtin-baseline
   QT_VERSION: '6.8.3'
   CARGO_C_VERSION: '0.10.26'
+  SDL3_VERSION: '3.4.14'
+  CHIAKI_COMMIT: '0e16950165f06e5c3291537c2eeba6e852be7120'
+  MOONLIGHT_COMMIT: 'f900dd4767759c7b9d0e93bcea666b55c69ea62f'
 
 jobs:
   build:
@@ -57,6 +60,73 @@ jobs:
           if (Test-Path third_party_local) { throw 'third_party_local must not be tracked in Git' }
           scripts/ci/fetch-sdks.ps1 -VeyraRoot . -WorkRoot C:\sdk-src -ManifestOut C:\sdk-manifest.json
 
+      - name: Stage CUDA driver headers (VFG/VFX) and ORT/DirectML headers (RIFE)
+        run: |
+          python -c @'
+          import io, json, pathlib, urllib.request, zipfile
+
+          # 1) CUDA driver header (cuda.h) from official PyPI wheel
+          cuda_out = pathlib.Path(r"C:\cuda-headers")
+          cuda_out.mkdir(parents=True, exist_ok=True)
+          meta = json.loads(urllib.request.urlopen("https://pypi.org/pypi/nvidia-cuda-runtime-cu12/json", timeout=30).read())
+          wheel = next(u for u in meta["urls"] if "win_amd64" in u["filename"])
+          print("Downloading", wheel["filename"])
+          raw = urllib.request.urlopen(wheel["url"], timeout=60).read()
+          with zipfile.ZipFile(io.BytesIO(raw)) as z:
+              prefix = "nvidia/cuda_runtime/include/"
+              for name in z.namelist():
+                  if name.startswith(prefix) and not name.endswith("/"):
+                      rel = name[len(prefix):]
+                      dst = cuda_out / rel
+                      dst.parent.mkdir(parents=True, exist_ok=True)
+                      dst.write_bytes(z.read(name))
+          assert (cuda_out / "cuda.h").is_file(), "cuda.h missing"
+
+          # 2) ONNX Runtime DirectML + DirectML NuGet headers for RIFE
+          def fetch_nupkg(pkg, ver, dst_dir, subprefix):
+              url = f"https://api.nuget.org/v3-flatcontainer/{pkg.lower()}/{ver}/{pkg.lower()}.{ver}.nupkg"
+              print("Downloading", url)
+              raw = urllib.request.urlopen(url, timeout=60).read()
+              with zipfile.ZipFile(io.BytesIO(raw)) as z:
+                  for name in z.namelist():
+                      if name.startswith(subprefix) and not name.endswith("/"):
+                          dst = pathlib.Path(dst_dir) / name
+                          dst.parent.mkdir(parents=True, exist_ok=True)
+                          dst.write_bytes(z.read(name))
+
+          fetch_nupkg("Microsoft.ML.OnnxRuntime.DirectML", "1.24.4", r"C:\ort-dml\ort", "build/native/include/")
+          fetch_nupkg("Microsoft.AI.DirectML", "1.15.4", r"C:\ort-dml\dml", "include/")
+          assert pathlib.Path(r"C:\ort-dml\ort\build\native\include\dml_provider_factory.h").is_file()
+          assert pathlib.Path(r"C:\ort-dml\dml\include\DirectML.h").is_file()
+          print("CUDA and ORT/DML headers staged.")
+          '@
+
+      - name: Stage pinned Chiaki (PS5) and moonlight-common-c (PC) sources
+        run: |
+          git config --global core.autocrlf false
+          git config --global core.eol lf
+          # Clean Chiaki checkout + patched worktree stage
+          git init -q C:\chiaki-clean
+          git -C C:\chiaki-clean remote add origin https://github.com/streetpea/chiaki-ng.git
+          git -C C:\chiaki-clean fetch -q --depth 1 origin $env:CHIAKI_COMMIT
+          git -C C:\chiaki-clean -c advice.detachedHead=false checkout -q FETCH_HEAD
+          git -C C:\chiaki-clean submodule update --init --recursive
+
+          git -C C:\chiaki-clean worktree add --detach C:\chiaki-stage $env:CHIAKI_COMMIT
+          git -C C:\chiaki-stage submodule update --init --recursive
+          foreach ($p in '0001-chiaki-msvc-vla-compat.patch','0002-chiaki-video-metadata.patch','0003-chiaki-feedback-history.patch','0004-chiaki-pad-proc-no.patch','0005-chiaki-udp-receive-buffer.patch') {
+            git -C C:\chiaki-stage apply (Resolve-Path "scripts/remoteplay/patches/$p").Path
+          }
+          python scripts/remoteplay/verify-chiaki-stage.py --stage C:\chiaki-stage --clean C:\chiaki-clean
+
+          # Pinned moonlight-common-c checkout with submodules
+          git init -q C:\moonlight-common-c
+          git -C C:\moonlight-common-c remote add origin https://github.com/moonlight-stream/moonlight-common-c.git
+          git -C C:\moonlight-common-c fetch -q --depth 1 origin $env:MOONLIGHT_COMMIT
+          git -C C:\moonlight-common-c -c advice.detachedHead=false checkout -q FETCH_HEAD
+          git -C C:\moonlight-common-c submodule update --init --recursive
+          python scripts/moonlight/verify-moonlight-stage.py --source C:\moonlight-common-c --lock scripts/moonlight/dependency-lock.json
+
       - name: Install Qt ${{ env.QT_VERSION }}
         uses: jurplel/install-qt-action@d325aaf2a8baeeda41ad0b5d39f84a6af9bcf005 # v4.3.0
         with:
@@ -68,36 +138,75 @@ jobs:
         with:
           arch: x64
 
-      - name: Restore cargo-c
-        id: cargo-c-cache
+      - name: Install prebuilt protoc and Python protobuf for Chiaki nanopb codegen
+        run: |
+          python -m pip install --quiet protobuf
+          $protocZip = "C:\protoc.zip"
+          Invoke-WebRequest -Uri "https://github.com/protocolbuffers/protobuf/releases/download/v29.3/protoc-29.3-win64.zip" -OutFile $protocZip
+          Expand-Archive -Path $protocZip -DestinationPath C:\protoc -Force
+          if (-not (Test-Path C:\protoc\bin\protoc.exe)) { throw 'protoc.exe missing' }
+          & C:\protoc\bin\protoc.exe --version
+
+      - name: Restore SDL3 ${{ env.SDL3_VERSION }} static cache
+        id: sdl3-cache
         uses: actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
         with:
-          path: ~\.cargo\bin\cargo-c*
-          key: cargo-c-${{ env.CARGO_C_VERSION }}-v1
+          path: C:\sdl3
+          key: sdl3-static-mt-${{ env.SDL3_VERSION }}-v1
+
+      - name: Build SDL3 ${{ env.SDL3_VERSION }} static (/MT)
+        if: steps.sdl3-cache.outputs.cache-hit != 'true'
+        run: |
+          git clone --depth 1 --branch "release-$env:SDL3_VERSION" https://github.com/libsdl-org/SDL.git C:\sdl3-src
+          cmake -S C:\sdl3-src -B C:\sdl3-build -G Ninja `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded `
+            -DCMAKE_INSTALL_PREFIX=C:/sdl3 `
+            -DSDL_STATIC=ON -DSDL_SHARED=OFF -DSDL_TEST_LIBRARY=OFF -DSDL_TESTS=OFF -DSDL_EXAMPLES=OFF
+          cmake --build C:\sdl3-build --parallel
+          cmake --install C:\sdl3-build
+          if (-not (Test-Path C:\sdl3\lib\cmake\SDL3\SDL3Config.cmake)) { throw 'SDL3Config.cmake missing' }
+
+      - name: Save SDL3 static cache
+        if: steps.sdl3-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: C:\sdl3
+          key: sdl3-static-mt-${{ env.SDL3_VERSION }}-v1
+
+      - name: Restore libdovi & cargo-c cache
+        id: dovi-cache
+        uses: actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: |
+            ~\.cargo\bin\cargo-c*
+            C:\dovi
+          key: dovi-3.4.0-cargo-c-${{ env.CARGO_C_VERSION }}-v1
 
       - name: Build libdovi 3.4.0 from source
+        if: steps.dovi-cache.outputs.cache-hit != 'true'
         run: |
-          if ('${{ steps.cargo-c-cache.outputs.cache-hit }}' -ne 'true') {
+          if (-not (Get-Command cargo-cinstall -ErrorAction SilentlyContinue)) {
             cargo install cargo-c --version $env:CARGO_C_VERSION --locked
           }
           Push-Location (Join-Path $env:DOVI_SOURCE 'dolby_vision')
           cargo cinstall --release --locked --prefix C:\dovi --library-type cdylib
           Pop-Location
-          # find_library() looks for dovi.lib; cargo-c names the MSVC import library dovi.dll.lib.
           if (-not (Test-Path C:\dovi\lib\dovi.lib) -and (Test-Path C:\dovi\lib\dovi.dll.lib)) {
             Copy-Item C:\dovi\lib\dovi.dll.lib C:\dovi\lib\dovi.lib
           }
           if (-not (Test-Path C:\dovi\include\libdovi\rpu_parser.h)) { throw 'libdovi header missing' }
-          Get-ChildItem C:\dovi -Recurse -File | Select-Object -ExpandProperty FullName
 
-      - name: Save cargo-c
-        if: steps.cargo-c-cache.outputs.cache-hit != 'true'
+      - name: Save libdovi & cargo-c cache
+        if: steps.dovi-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
         with:
-          path: ~\.cargo\bin\cargo-c*
-          key: cargo-c-${{ env.CARGO_C_VERSION }}-v1
+          path: |
+            ~\.cargo\bin\cargo-c*
+            C:\dovi
+          key: dovi-3.4.0-cargo-c-${{ env.CARGO_C_VERSION }}-v1
 
-      - name: Fetch vcpkg at the builtin-baseline and prepare the patched FFmpeg port
+      - name: Fetch vcpkg at the builtin-baseline and prepare overlays
         run: |
           git init -q C:\v
           git -C C:\v remote add origin https://github.com/microsoft/vcpkg.git
@@ -105,7 +214,8 @@ jobs:
           git -C C:\v -c advice.detachedHead=false checkout -q FETCH_HEAD
           C:\v\bootstrap-vcpkg.bat -disableMetrics
           python scripts/ci/make-ffmpeg-overlay.py C:\v . C:\vcpkg-overlay
-          $all = (Get-ChildItem C:\vcpkg-overlay -Recurse -File | Get-FileHash | ForEach-Object Hash) -join ''
+          $files = @(Get-ChildItem C:\vcpkg-overlay -Recurse -File) + @(Get-ChildItem scripts\xbox\vcpkg-overlay -Recurse -File)
+          $all = ($files | Sort-Object FullName | Get-FileHash | ForEach-Object Hash) -join ''
           "OVERLAY_HASH=$([Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes($all))))" >> $env:GITHUB_ENV
 
       - name: Restore vcpkg binary cache
@@ -113,50 +223,100 @@ jobs:
         uses: actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
         with:
           path: C:\vcache
-          key: vcpkg-${{ env.VCPKG_COMMIT }}-${{ env.OVERLAY_HASH }}-v1
+          key: vcpkg-full-${{ env.VCPKG_COMMIT }}-${{ env.OVERLAY_HASH }}-v1
+          restore-keys: |
+            vcpkg-full-${{ env.VCPKG_COMMIT }}-
 
-      - name: Build FFmpeg 9.0.1 (slices256, deinterlace, D3D12VA reference pool), dav1d, zlib and libass
+      - name: Build vcpkg dependencies (FFmpeg, libass, PS5/Moonlight/Xbox libs)
         env:
           VCPKG_BINARY_SOURCES: clear;files,C:\vcache,readwrite
           VCPKG_DISABLE_METRICS: '1'
         run: |
           New-Item -ItemType Directory -Force C:\vcache | Out-Null
-          # --classic: vcpkg.json in the repo root would otherwise force manifest mode.
-          C:\v\vcpkg.exe install --classic --overlay-ports=C:\vcpkg-overlay --clean-after-build `
+          $xboxOverlay = (Resolve-Path scripts\xbox\vcpkg-overlay).Path
+          C:\v\vcpkg.exe install --classic `
+            --overlay-ports=C:\vcpkg-overlay `
+            --overlay-ports=$xboxOverlay `
+            --clean-after-build `
             'ffmpeg[core,avcodec,avformat,avfilter,swresample,swscale,dav1d,zlib]:x64-windows' `
-            'libass:x64-windows-static'
+            'libass:x64-windows-static' `
+            'openssl:x64-windows-static' `
+            'opus:x64-windows-static' `
+            'json-c:x64-windows-static' `
+            'libevent:x64-windows-static' `
+            'miniupnpc:x64-windows-static' `
+            'pkgconf:x64-windows-static' `
+            'libdatachannel[srtp]:x64-windows-static' `
+            'nlohmann-json:x64-windows-static'
           $list = C:\v\vcpkg.exe list --classic
           $list | Set-Content -Encoding utf8 C:\vcpkg-list.txt
           $list | Write-Host
           if (-not ($list -match '^ffmpeg:x64-windows')) { throw 'ffmpeg not installed' }
+          if (-not ($list -match '^libdatachannel:x64-windows-static')) { throw 'libdatachannel not installed' }
 
       - name: Save vcpkg binary cache
         if: steps.vcpkg-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
         with:
           path: C:\vcache
-          key: vcpkg-${{ env.VCPKG_COMMIT }}-${{ env.OVERLAY_HASH }}-v1
+          key: vcpkg-full-${{ env.VCPKG_COMMIT }}-${{ env.OVERLAY_HASH }}-v1
 
-      - name: Configure (preset x64-release)
+      - name: Configure (preset x64-release, full streaming + VFG/RIFE)
         run: |
+          $protoc = "C:\protoc\bin\protoc.exe"
+          $pkgconf = (Get-ChildItem C:\v\installed\x64-windows-static -Filter pkgconf.exe -Recurse | Select-Object -First 1).FullName
+          if (-not (Test-Path $protoc)) { throw 'protoc.exe not found' }
+          if (-not $pkgconf) { throw 'pkgconf.exe not found in vcpkg x64-windows-static' }
+          $pythonExe = (Get-Command python).Source
+          $env:PATH = "C:\protoc\bin;$(Split-Path $pkgconf);$env:PATH"
+          $env:PKG_CONFIG_PATH = "C:/v/installed/x64-windows-static/lib/pkgconfig"
+          Write-Host "PROTOC=$protoc"
+          Write-Host "PKG_CONFIG=$pkgconf"
           cmake --preset x64-release -B C:\b `
             -DVEYRA_BUILD_QML_UI=ON `
             -DVEYRA_ENABLE_EXPERIMENTAL_DLSSNR=ON `
+            -DVEYRA_ENABLE_REMOTEPLAY=ON `
+            -DVEYRA_ENABLE_MOONLIGHT=ON `
+            -DVEYRA_ENABLE_XBOX=ON `
             "-DVEYRA_DLSS_SDK_ROOT=$((Resolve-Path third_party_local/nvidia/DLSS_SDK_310.7.0).Path)" `
+            -DVEYRA_CUDA_DRIVER_INCLUDE_DIR=C:/cuda-headers `
+            -DVEYRA_ORT_DML_ROOT=C:/ort-dml `
             -DVEYRA_FFMPEG_ROOT=C:/v/installed/x64-windows `
             -DVEYRA_LIBASS_ROOT=C:/v/installed/x64-windows-static `
             -DVEYRA_LIBDOVI_ROOT=C:/dovi `
-            "-DCMAKE_PREFIX_PATH=$env:QT_ROOT_DIR"
+            -DVEYRA_RP_CHIAKI_SOURCE_DIR=C:/chiaki-stage `
+            -DVEYRA_RP_CHIAKI_VERIFY_DIR=C:/chiaki-clean `
+            -DVEYRA_MOONLIGHT_SOURCE_DIR=C:/moonlight-common-c `
+            -DSDL3_DIR=C:/sdl3/lib/cmake/SDL3 `
+            -DOPENSSL_ROOT_DIR=C:/v/installed/x64-windows-static `
+            -DOPENSSL_USE_STATIC_LIBS=ON `
+            -DCURL_USE_LIBPSL=OFF `
+            "-DPROTOC=$protoc" `
+            "-DPKG_CONFIG_EXECUTABLE=$pkgconf" `
+            "-DPYTHON_EXECUTABLE=$pythonExe" `
+            "-DPython3_EXECUTABLE=$pythonExe" `
+            "-DCMAKE_PREFIX_PATH=$env:QT_ROOT_DIR;C:/v/installed/x64-windows-static;C:/sdl3"
 
-      - name: Build veyra_qml_ui, virtual camera and shaders
+      - name: Build veyra_qml_ui, virtual camera, shaders and unit tests
         run: |
-          cmake --build C:\b --parallel --target veyra_qml_ui veyra_virtualcam_components
+          $env:PATH = "C:\protoc\bin;$env:PATH"
+          cmake --build C:\b --parallel --target veyra_qml_ui veyra_virtualcam_components veyra_xbox_tests veyra_qml_quick_tests veyra_moonlight_protocol_tests veyra_remoteplay_udp_buffer_tests
           $shaders = ninja -C C:\b -t targets all | ForEach-Object { ($_ -split ':')[0] } | Where-Object { $_ -match '^veyra_shader_' } | Sort-Object -Unique
           if ($shaders) { cmake --build C:\b --parallel --target @shaders }
 
+      - name: Run offline unit and Qt Quick tests
+        run: |
+          $env:PATH = "$env:QT_ROOT_DIR\bin;C:\v\installed\x64-windows\bin;C:\dovi\bin;$env:PATH"
+          $env:QT_PLUGIN_PATH = "$env:QT_ROOT_DIR\plugins"
+          $env:QT_QPA_PLATFORM = "offscreen"
+          & C:\b\veyra_xbox_tests.exe
+          & C:\b\veyra_moonlight_protocol_tests.exe
+          & C:\b\veyra_remoteplay_udp_buffer_tests.exe
+          & C:\b\veyra_qml_quick_tests.exe
+
       - name: Stage portable package
         run: |
-          $name = "Veyra-$($env:GITHUB_SHA.Substring(0, 10))-win64-ci-no-gpu-runtimes"
+          $name = "Veyra-$($env:GITHUB_SHA.Substring(0, 10))-win64-full-no-gpu-runtimes"
           $stage = "C:\out\$name"
           New-Item -ItemType Directory -Force $stage, "$stage\qml", "$stage\licenses" | Out-Null
           Copy-Item C:\b\veyra_qml_ui.exe $stage
@@ -167,7 +327,6 @@ jobs:
             New-Item -ItemType Directory -Force (Split-Path $dst) | Out-Null
             Copy-Item $_.FullName $dst
           }
-          # 64-bit module + setup in C:\b\virtualcam, 32-bit module from the x86 ExternalProject.
           New-Item -ItemType Directory -Force "$stage\virtualcam" | Out-Null
           foreach ($f in 'virtualcam\veyra-virtualcam64.dll', 'virtualcam\veyra-camera-setup.exe', 'virtualcam-x86\virtualcam\veyra-virtualcam32.dll') {
             Copy-Item (Join-Path C:\b $f) "$stage\virtualcam"
@@ -187,9 +346,8 @@ jobs:
           Copy-Item "$env:VCToolsRedistDir\x64\Microsoft.VC143.CRT\*.dll" $stage
           foreach ($f in 'LICENSE', 'THIRD_PARTY_NOTICES.md', 'README.md', 'README_EN.md') { Copy-Item $f $stage }
           @'
-          Veyra Windows CI build for development testing.
-          The official release packages are on the project's GitHub Releases page.
-          DLSS, XeSS and other proprietary GPU runtimes, RIFE models, and optional audio packages are absent.
+          Veyra Windows full CI build (PS5 + Moonlight + Xbox background control + VFG/DLSS/RIFE).
+          Copy runtime/ and runtime_local/ from the official portable package to enable proprietary GPU runtimes.
           '@ | Set-Content -Encoding utf8 "$stage\CI-BUILD.txt"
           Copy-Item licenses\* "$stage\licenses" -Recurse
           Copy-Item C:\v\installed\x64-windows\share\ffmpeg\copyright "$stage\licenses\FFMPEG-COPYRIGHT.txt"
@@ -201,6 +359,7 @@ jobs:
             msvc = $env:VCToolsVersion; windowsSdk = $env:WindowsSDKVersion; qt = $env:QT_VERSION
             vcpkgCommit = $env:VCPKG_COMMIT; vcpkgPackages = (Get-Content C:\vcpkg-list.txt)
             sdks = (Get-Content C:\sdk-manifest.json -Raw | ConvertFrom-Json)
+            features = @('DLSSNR', 'VFG', 'RIFE', 'REMOTEPLAY', 'MOONLIGHT', 'XBOX')
             notIncluded = 'Proprietary GPU runtimes (runtime/, runtime_local/), BGM, VB-CABLE package'
           } | ConvertTo-Json -Depth 6 | Set-Content -Encoding utf8 "$stage\BUILD-INFO.json"
           Compress-Archive -Path $stage -DestinationPath "C:\out\$name.zip"
@@ -220,15 +379,7 @@ jobs:
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: veyra-windows-ci-no-gpu-runtimes
+          name: veyra-windows-full-no-gpu-runtimes
           path: |
             C:\out\*.zip
             C:\out\SHA256SUMS.txt
-
-      - name: Attest build provenance
-        if: github.event_name != 'pull_request'
-        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
-        with:
-          subject-path: |
-            C:\out\*.zip
-            ${{ env.STAGE }}\veyra_qml_ui.exe
