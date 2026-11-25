@@ -165,7 +165,9 @@ jobs:
             -DSDL_STATIC=ON -DSDL_SHARED=OFF -DSDL_TEST_LIBRARY=OFF -DSDL_TESTS=OFF -DSDL_EXAMPLES=OFF
           cmake --build C:\sdl3-build --parallel
           cmake --install C:\sdl3-build
-          if (-not (Test-Path C:\sdl3\lib\cmake\SDL3\SDL3Config.cmake)) { throw 'SDL3Config.cmake missing' }
+          $sdl3Cfg = Get-ChildItem C:\sdl3 -Filter SDL3Config.cmake -Recurse | Select-Object -First 1
+          if (-not $sdl3Cfg) { throw 'SDL3Config.cmake missing' }
+          Write-Host "SDL3Config: $($sdl3Cfg.FullName)"
 
       - name: Save SDL3 static cache
         if: steps.sdl3-cache.outputs.cache-hit != 'true'
@@ -265,13 +267,16 @@ jobs:
         run: |
           $protoc = "C:\protoc\bin\protoc.exe"
           $pkgconf = (Get-ChildItem C:\v\installed\x64-windows-static -Filter pkgconf.exe -Recurse | Select-Object -First 1).FullName
+          $sdl3Dir = (Get-ChildItem C:\sdl3 -Filter SDL3Config.cmake -Recurse | Select-Object -First 1).DirectoryName
           if (-not (Test-Path $protoc)) { throw 'protoc.exe not found' }
           if (-not $pkgconf) { throw 'pkgconf.exe not found in vcpkg x64-windows-static' }
+          if (-not $sdl3Dir) { throw 'SDL3Config.cmake not found under C:\sdl3' }
           $pythonExe = (Get-Command python).Source
           $env:PATH = "C:\protoc\bin;$(Split-Path $pkgconf);$env:PATH"
           $env:PKG_CONFIG_PATH = "C:/v/installed/x64-windows-static/lib/pkgconfig"
           Write-Host "PROTOC=$protoc"
           Write-Host "PKG_CONFIG=$pkgconf"
+          Write-Host "SDL3_DIR=$sdl3Dir"
           cmake --preset x64-release -B C:\b `
             -DVEYRA_BUILD_QML_UI=ON `
             -DVEYRA_ENABLE_EXPERIMENTAL_DLSSNR=ON `
@@ -287,7 +292,7 @@ jobs:
             -DVEYRA_RP_CHIAKI_SOURCE_DIR=C:/chiaki-stage `
             -DVEYRA_RP_CHIAKI_VERIFY_DIR=C:/chiaki-clean `
             -DVEYRA_MOONLIGHT_SOURCE_DIR=C:/moonlight-common-c `
-            -DSDL3_DIR=C:/sdl3/lib/cmake/SDL3 `
+            "-DSDL3_DIR=$sdl3Dir" `
             -DOPENSSL_ROOT_DIR=C:/v/installed/x64-windows-static `
             -DOPENSSL_USE_STATIC_LIBS=ON `
             -DCURL_USE_LIBPSL=OFF `
