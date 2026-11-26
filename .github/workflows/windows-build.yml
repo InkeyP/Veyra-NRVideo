@@ -7,6 +7,13 @@ name: Windows build (reproducible)
 
 on:
   workflow_dispatch:
+  workflow_call:
+    inputs:
+      ref:
+        description: 'Git ref or commit SHA to check out and build'
+        required: false
+        type: string
+        default: ''
   push:
     branches: ['ci/**', 'main']
     tags: ['v*']
@@ -53,6 +60,7 @@ jobs:
     steps:
       - uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # v6.0.0
         with:
+          ref: ${{ inputs.ref }}
           persist-credentials: false
 
       - name: Stage pinned SDK headers and import libraries
@@ -323,7 +331,8 @@ jobs:
 
       - name: Stage portable package
         run: |
-          $name = "Veyra-$($env:GITHUB_SHA.Substring(0, 10))-win64-full-no-gpu-runtimes"
+          $buildSha = (git rev-parse HEAD).Trim()
+          $name = "Veyra-$($buildSha.Substring(0, 10))-win64-full-no-gpu-runtimes"
           $stage = "C:\out\$name"
           New-Item -ItemType Directory -Force $stage, "$stage\qml", "$stage\licenses" | Out-Null
           Copy-Item C:\b\veyra_qml_ui.exe $stage
@@ -361,8 +370,15 @@ jobs:
           Copy-Item C:\v\installed\x64-windows\share\dav1d\copyright "$stage\licenses\DAV1D-COPYRIGHT.txt"
           Copy-Item C:\v\installed\x64-windows-static\share\libass\copyright "$stage\licenses\LIBASS-COPYRIGHT.txt"
           Copy-Item (Join-Path $env:DOVI_SOURCE 'LICENSE') "$stage\licenses\LIBDOVI-LICENSE.txt"
+          @'
+          [Paths]
+          Prefix=.
+          Plugins=.
+          QmlImports=qml
+          Translations=translations
+          '@ | Set-Content -Encoding ascii "$stage\qt.conf"
           [ordered]@{
-            commit = $env:GITHUB_SHA; runId = $env:GITHUB_RUN_ID; runner = "$env:ImageOS $env:ImageVersion"
+            commit = $buildSha; runId = $env:GITHUB_RUN_ID; runner = "$env:ImageOS $env:ImageVersion"
             msvc = $env:VCToolsVersion; windowsSdk = $env:WindowsSDKVersion; qt = $env:QT_VERSION
             vcpkgCommit = $env:VCPKG_COMMIT; vcpkgPackages = (Get-Content C:\vcpkg-list.txt)
             sdks = (Get-Content C:\sdk-manifest.json -Raw | ConvertFrom-Json)

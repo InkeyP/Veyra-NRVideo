@@ -1,0 +1,127 @@
+name: Sync upstream and build
+
+# Periodically fetches Likely7/Veyra-NRVideo:main, mirrors it to fork main
+# (best-effort fast-forward), merges new upstream commits into ci/full-build
+# while preserving fork workflow files, and invokes windows-build.yml via
+# workflow_call whenever source/build files change.
+# Keeps PR branch feat/xbox-background-control completely untouched.
+
+on:
+  schedule:
+    - cron: '0 3 * * *' # Daily at 03:00 UTC (11:00 UTC+8)
+  workflow_dispatch:
+    inputs:
+      force_build:
+        description: 'Trigger a full Windows build even if upstream has no new commits'
+        required: false
+        type: boolean
+        default: false
+
+concurrency:
+  group: sync-upstream-ci-full-build
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      updated: ${{ steps.sync.outputs.updated }}
+      head_sha: ${{ steps.sync.outputs.head_sha }}
+      upstream_sha: ${{ steps.sync.outputs.upstream_sha }}
+    steps:
+      - uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # v6.0.0
+        with:
+          ref: ci/full-build
+          fetch-depth: 0
+
+      - name: Fetch upstream and merge into ci/full-build
+        id: sync
+        shell: bash
+        env:
+          FORCE_BUILD: ${{ inputs.force_build || false }}
+        run: |
+          set -euo pipefail
+
+          git remote add upstream https://github.com/Likely7/Veyra-NRVideo.git
+          git fetch --no-tags upstream main
+
+          UPSTREAM_SHA="$(git rev-parse upstream/main)"
+          echo "upstream_sha=${UPSTREAM_SHA}" >> "$GITHUB_OUTPUT"
+          echo "Upstream Likely7/Veyra-NRVideo:main is at ${UPSTREAM_SHA}"
+
+          # Best-effort fast-forward mirror of fork's main branch
+          if git push origin "upstream/main:refs/heads/main"; then
+            echo "Mirrored upstream/main -> origin/main"
+          else
+            echo "::warning::Could not fast-forward origin/main (e.g. upstream workflow change); continuing with ci/full-build sync."
+          fi
+
+          if git merge-base --is-ancestor upstream/main HEAD; then
+            HEAD_SHA="$(git rev-parse HEAD)"
+            echo "ci/full-build (${HEAD_SHA}) already includes upstream/main (${UPSTREAM_SHA})."
+            echo "head_sha=${HEAD_SHA}" >> "$GITHUB_OUTPUT"
+            if [ "${FORCE_BUILD}" = "true" ]; then
+              echo "force_build=true requested; proceeding to build."
+              echo "updated=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "updated=false" >> "$GITHUB_OUTPUT"
+            fi
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          BEFORE_SHA="$(git rev-parse HEAD)"
+          set +e
+          git merge --no-commit --no-ff upstream/main
+          MERGE_RC=$?
+          set -e
+
+          # Always keep fork's .github/workflows byte-identical to HEAD so
+          # GITHUB_TOKEN can push without PAT 'workflows' scope and without
+          # overwriting our fork CI workflows.
+          git rm -rf --quiet --ignore-unmatch .github/workflows
+          git checkout HEAD -- .github/workflows
+
+          if [ "${MERGE_RC}" -ne 0 ]; then
+            REMAINING="$(git diff --name-only --diff-filter=U)"
+            if [ -n "${REMAINING}" ]; then
+              echo "::error::Automatic merge failed due to source conflicts in:"
+              echo "${REMAINING}"
+              git merge --abort
+              exit 1
+            fi
+          fi
+
+          # Check whether any build-relevant files actually changed compared to BEFORE_SHA
+          CHANGED_FILES="$(git diff --cached --name-only)"
+          git commit -m "Merge upstream Likely7/Veyra-NRVideo:main (${UPSTREAM_SHA:0:7}) into ci/full-build"
+          git push origin HEAD:refs/heads/ci/full-build
+
+          NEW_SHA="$(git rev-parse HEAD)"
+          echo "Merged upstream/main into ci/full-build -> ${NEW_SHA}"
+          echo "head_sha=${NEW_SHA}" >> "$GITHUB_OUTPUT"
+
+          if [ "${FORCE_BUILD}" = "true" ]; then
+            echo "updated=true" >> "$GITHUB_OUTPUT"
+          elif echo "${CHANGED_FILES}" | grep -Eq '^(src/|include/|qml/|i18n/|tests/|scripts/ci/|scripts/remoteplay/|scripts/moonlight/|scripts/xbox/|CMakeLists\.txt|vcpkg\.json)'; then
+            echo "Build-relevant files changed; triggering build."
+            echo "updated=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Merged non-code changes only (e.g. docs/workflows); skipping build."
+            echo "updated=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    needs: sync
+    if: needs.sync.outputs.updated == 'true'
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    uses: ./.github/workflows/windows-build.yml
+    with:
+      ref: ${{ needs.sync.outputs.head_sha }}
